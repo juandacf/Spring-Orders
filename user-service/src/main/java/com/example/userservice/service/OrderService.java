@@ -122,6 +122,98 @@ public class OrderService {
     }
 
     /**
+     * Cancel an existing order. Fetches the order, verifies it can be cancelled,
+     * updates its status, and saves both the order and outbox event in a transaction.
+     */
+    public Mono<Order> cancelOrder(String orderId) {
+        return Mono.fromCallable(() -> {
+            software.amazon.awssdk.services.dynamodb.model.GetItemRequest getRequest = software.amazon.awssdk.services.dynamodb.model.GetItemRequest.builder()
+                .tableName(ORDER_TABLE)
+                .key(Map.of("orderId", AttributeValue.builder().s(orderId).build()))
+                .build();
+                
+            software.amazon.awssdk.services.dynamodb.model.GetItemResponse response = dynamoDbAsyncClient.getItem(getRequest).get();
+            if (!response.hasItem() || response.item().isEmpty()) {
+                throw new RuntimeException("Order not found");
+            }
+            
+            Map<String, AttributeValue> item = response.item();
+            String currentStatus = item.get("status").s();
+            if (OrderStatus.CANCELLED.name().equals(currentStatus) || OrderStatus.DELIVERED.name().equals(currentStatus)) {
+                throw new RuntimeException("Order cannot be cancelled in status: " + currentStatus);
+            }
+            
+            Order order = new Order(
+                orderId,
+                item.get("customerId").s(),
+                com.example.userservice.model.OrderType.valueOf(item.get("type").s()),
+                OrderStatus.CANCELLED,
+                Instant.parse(item.get("createdAt").s()),
+                Instant.now(),
+                item.containsKey("rating") ? Integer.parseInt(item.get("rating").n()) : null
+            );
+
+            // Build outbox event payload
+            Map<String, Object> eventPayload = new HashMap<>();
+            eventPayload.put("orderId", order.getOrderId());
+            eventPayload.put("customerId", order.getCustomerId());
+            eventPayload.put("type", order.getType().name());
+            eventPayload.put("status", order.getStatus().name());
+            eventPayload.put("timestamp", order.getUpdatedAt().toString());
+            String payloadJson;
+            try {
+                payloadJson = objectMapper.writeValueAsString(eventPayload);
+            } catch (JsonProcessingException e) {
+                throw new RuntimeException("Failed to serialize event payload", e);
+            }
+
+            OutboxEvent event = new OutboxEvent(
+                UUID.randomUUID().toString(),
+                "Order",
+                order.getOrderId(),
+                "OrderCancelled",
+                payloadJson,
+                order.getUpdatedAt(),
+                null,
+                false
+            );
+
+            // Build DynamoDB transaction
+            TransactWriteItemsRequest txnRequest = TransactWriteItemsRequest.builder()
+                .transactItems(
+                    TransactWriteItem.builder()
+                        .put(Put.builder()
+                            .tableName(ORDER_TABLE)
+                            .item(toAttributeMap(order))
+                            .build())
+                        .build(),
+                    TransactWriteItem.builder()
+                        .put(Put.builder()
+                            .tableName(OUTBOX_TABLE)
+                            .item(toAttributeMap(event))
+                            .build())
+                        .build()
+                )
+                .build();
+
+            CompletableFuture<Void> writeFuture = dynamoDbAsyncClient.transactWriteItems(txnRequest)
+                .thenAccept(res -> {
+                    // After the transaction completes, publish event asynchronously
+                    kafkaTemplate.send(ORDER_EVENTS_TOPIC, order.getOrderId(), eventPayload);
+                });
+
+            // Wait for the transaction to complete
+            try {
+                writeFuture.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to persist cancelled order and outbox event", e);
+            }
+
+            return order;
+        });
+    }
+
+    /**
      * Convert an Order to a DynamoDB item represented as a map of
      * attribute values. In a production setting you may want to use an
      * object mapper like DynamoDbEnhancedClient, but here we build the map

@@ -74,14 +74,22 @@ public class OrderEventHandler {
     @KafkaListener(topics = "order-events", groupId = "delivery-group")
     public void listen(@Payload OrderEventPayload payload) {
         log.info("Received order event: {}", payload);
+        StateMachine<DeliveryStates, DeliveryEvents> stateMachine = stateMachineFactory.getStateMachine(payload.getOrderId());
+
+        if ("CANCELLED".equals(payload.getStatus())) {
+            log.info("Processing cancellation for order: {}", payload.getOrderId());
+            stateMachine.startReactively()
+                .then(stateMachine.sendEvent(Mono.just(MessageBuilder.withPayload(DeliveryEvents.CANCEL).build())).then())
+                .subscribe();
+            return;
+        }
+
         String type = payload.getType();
         Function<StateMachine<DeliveryStates, DeliveryEvents>, Mono<Void>> processor = processors.get(type);
         if (processor == null) {
             log.error("Received order with unknown type: {}", type);
             return;
         }
-        // Create a new state machine instance per order
-        StateMachine<DeliveryStates, DeliveryEvents> stateMachine = stateMachineFactory.getStateMachine(payload.getOrderId());
         processor.apply(stateMachine).subscribe();
         // In a real application, save updated state to database and possibly emit events
     }

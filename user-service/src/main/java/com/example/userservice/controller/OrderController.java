@@ -6,6 +6,8 @@ import com.example.userservice.service.OrderService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -34,5 +36,11 @@ public class OrderController {
     @ResponseStatus(HttpStatus.CREATED)
     public Mono<Order> createOrder(@Valid @RequestBody OrderRequest request) {
         return orderService.createOrder(request);
+    }
+
+    @PutMapping("/{id}/cancel")
+    @ResponseStatus(HttpStatus.OK)
+    public Mono<Order> cancelOrder(@PathVariable("id") String id) {
+        return orderService.cancelOrder(id);
     }
 }
