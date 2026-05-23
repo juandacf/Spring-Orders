@@ -1,0 +1,174 @@
+
+services:
+  # Zookeeper is required for older Kafka versions.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # Kafka broker with both plaintext and SSL listeners. For simplicity
+  # certificate files are not provided here; mount your own JKS files into
+  # ./kafka-ssl and set the KAFKA_SSL_* variables if you want SSL. Otherwise,
+  # the broker will accept plaintext connections on port 9092.
+  kafka:
+    image: confluentinc/cp-kafka:7.5.1
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # DynamoDB Local for local development. Runs in memory and wipes data on
+  # container restart. For persistence remove the -inMemory flag and mount a
+  # volume at /home/dynamodblocal/data.
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: dynamodb
+    command: -jar DynamoDBLocal.jar -inMemory -sharedDb
+    ports:
+      - "8000:8000"
+
+  dynamodb-init:
+    image: amazon/aws-cli
+    container_name: dynamodb-init
+    depends_on:
+      - dynamodb
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+    entrypoint: ""
+    command:
+      - /bin/sh
+      - -c
+      - |
+        until aws dynamodb list-tables --endpoint-url http://dynamodb:8000 > /dev/null 2>&1; do
+          echo 'Waiting for DynamoDB...'
+          sleep 1
+        done
+
+        if ! aws dynamodb describe-table --table-name Orders --endpoint-url http://dynamodb:8000 > /dev/null 2>&1; then
+          echo 'Creating Orders table...'
+          aws dynamodb create-table \
+              --table-name Orders \
+              --attribute-definitions \
+                  AttributeName=orderId,AttributeType=S \
+              --key-schema \
+                  AttributeName=orderId,KeyType=HASH \
+              --provisioned-throughput \
+                  ReadCapacityUnits=5,WriteCapacityUnits=5 \
+              --endpoint-url http://dynamodb:8000
+        fi
+
+        if ! aws dynamodb describe-table --table-name Outbox --endpoint-url http://dynamodb:8000 > /dev/null 2>&1; then
+          echo 'Creating Outbox table...'
+          aws dynamodb create-table \
+              --table-name Outbox \
+              --attribute-definitions \
+                  AttributeName=pk,AttributeType=S \
+                  AttributeName=sk,AttributeType=S \
+              --key-schema \
+                  AttributeName=pk,KeyType=HASH \
+                  AttributeName=sk,KeyType=RANGE \
+              --provisioned-throughput \
+                  ReadCapacityUnits=5,WriteCapacityUnits=5 \
+              --endpoint-url http://dynamodb:8000
+        fi
+
+        echo 'DynamoDB tables initialization complete.'
+
+  # User service built from the provided source code. It publishes order
+  # creation events to Kafka and stores orders and outbox records in
+  # DynamoDB.
+  user-service:
+    build:
+      context: ./user-service
+    container_name: user-service
+    depends_on:
+      kafka:
+        condition: service_started
+      dynamodb:
+        condition: service_started
+      dynamodb-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Uncomment and set these if using SSL
+      # KAFKA_SECURITY_PROTOCOL: SSL
+      # KAFKA_SSL_TRUSTSTORE_LOCATION: /etc/kafka/secrets/kafka.truststore.jks
+      # KAFKA_SSL_TRUSTSTORE_PASSWORD: truststore-password
+      # KAFKA_SSL_KEYSTORE_LOCATION: /etc/kafka/secrets/kafka.server.keystore.jks
+      # KAFKA_SSL_KEYSTORE_PASSWORD: keystore-password
+      # KAFKA_SSL_KEY_PASSWORD: keystore-password
+    ports:
+      - "8081:8080"
+
+  # Delivery service consumes order events from Kafka, applies the
+  # state machine logic and exposes a rating endpoint. It also uses
+  # DynamoDB for persistence.
+  delivery-service:
+    build:
+      context: ./delivery-service
+    container_name: delivery-service
+    depends_on:
+      kafka:
+        condition: service_started
+      dynamodb:
+        condition: service_started
+      dynamodb-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Configure retry behaviour using environment variables. These are
+      # consumed by delivery-service's KafkaConsumerConfig. By default the
+      # service will retry failed messages 3 times with no delay. Adjust
+      # KAFKA_MAX_ATTEMPTS and KAFKA_RETRY_INTERVAL_MS to tune.
+      KAFKA_MAX_ATTEMPTS: 3
+      KAFKA_RETRY_INTERVAL_MS: 200
+      JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
+    ports:
+      - "8082:8080"
+      - "5005:5005"
+
+  # DynamoDB web admin for viewing tables and items. Accessible on
+  # http://localhost:8001 when running.
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin
+    container_name: dynamodb-admin
+    depends_on:
+      - dynamodb
+    environment:
+      DYNAMO_ENDPOINT: http://dynamodb:8000
+    ports:
+      - "8001:8001"

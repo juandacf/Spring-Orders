@@ -1,0 +1,8 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: delivery-service
+
+# Spring Kafka consumer properties can be overridden using environment
+# variables. See KafkaConsumerConfig for details.
